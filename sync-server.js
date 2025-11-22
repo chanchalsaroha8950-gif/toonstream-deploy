@@ -1,9 +1,7 @@
 import express from "express";
 import cron from "node-cron";
-import { exec } from "child_process";
-import { promisify } from "util";
+import { start as runSyncScript } from "./toonstream-supabase-sync.js";
 
-const execAsync = promisify(exec);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -74,11 +72,8 @@ async function runSync() {
   console.log(`${"=".repeat(60)}\n`);
 
   try {
-    // Run the sync script
-    const { stdout, stderr } = await execAsync("node toonstream-supabase-sync.js");
-    
-    if (stdout) console.log(stdout);
-    if (stderr) console.error(stderr);
+    // Run the sync script directly
+    await runSyncScript();
 
     syncStatus.lastRunSuccess = true;
     syncStatus.successfulRuns++;
@@ -87,6 +82,9 @@ async function runSync() {
     syncStatus.lastRunSuccess = false;
     syncStatus.failedRuns++;
     console.error(`\n❌ Sync failed: ${error.message}\n`);
+    if (error.stack) {
+      console.error(error.stack);
+    }
   } finally {
     syncStatus.isRunning = false;
   }
