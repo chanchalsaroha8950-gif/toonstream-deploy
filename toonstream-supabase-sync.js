@@ -22,12 +22,31 @@ const supabase = createClient(
 );
 
 const CONFIG = {
-  homeUrl: "https://toonstream.love/",
+  homeUrl: process.env.TOONSTREAM_HOME_URL || "https://toonstream.love/",
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS || 60_000),
   requestTimeout: 30_000,
   maxRetries: 3,
   maxParallelSeriesFetch: Number(process.env.MAX_PARALLEL_SERIES || 4),
+  embedMaxDepth: Number(process.env.EMBED_MAX_DEPTH || 3),
+  toonstreamCookies: process.env.TOONSTREAM_COOKIES?.trim() || null,
+  ajaxUrl:
+    process.env.TOONSTREAM_AJAX_URL ||
+    "https://toonstream.love/wp-admin/admin-ajax.php",
 };
+
+const defaultFallbacks = [
+  `${CONFIG.homeUrl}home/`,
+  `${CONFIG.homeUrl}page/1/`,
+];
+
+const envFallbacks = (process.env.TOONSTREAM_HOME_FALLBACKS || "")
+  .split(",")
+  .map((u) => u.trim())
+  .filter(Boolean);
+
+CONFIG.homepageCandidates = Array.from(
+  new Set([CONFIG.homeUrl, ...envFallbacks, ...defaultFallbacks]),
+);
 
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -38,6 +57,22 @@ const USER_AGENTS = [
 
 const TMDB_BASE_URL = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/original";
+
+const TOONSTREAM_HOST = (() => {
+  try {
+    return new URL(CONFIG.homeUrl).hostname.replace(/^www\./, "");
+  } catch {
+    return null;
+  }
+})();
+
+const TOONSTREAM_ORIGIN = (() => {
+  try {
+    return new URL(CONFIG.homeUrl).origin;
+  } catch {
+    return CONFIG.homeUrl;
+  }
+})();
 
 const seriesCache = new Map();
 const processedEpisodes = new Set();
@@ -91,6 +126,16 @@ function normalizeUrl(rawUrl, base = CONFIG.homeUrl) {
   }
 }
 
+function isToonstreamUrl(url) {
+  if (!url || !TOONSTREAM_HOST) return false;
+  try {
+    const hostname = new URL(url).hostname.replace(/^www\./, "");
+    return hostname === TOONSTREAM_HOST;
+  } catch {
+    return false;
+  }
+}
+
 function extractSeriesSlugFromUrl(seriesUrl) {
   try {
     const u = new URL(seriesUrl);
@@ -124,7 +169,49 @@ function buildEpisodeUrl(seriesSlug, season, episode) {
   return `${CONFIG.homeUrl}episode/${seriesSlug}-${season}x${episode}/`;
 }
 
-async function fetchHtmlWithRetry(url, retries = CONFIG.maxRetries) {
+function buildRequestHeaders(url, options = {}) {
+  const headers = {
+    "User-Agent": getUA(),
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+  };
+
+  if (options.referer) {
+    headers.Referer = options.referer;
+  }
+
+  if (options.headers) {
+    Object.assign(headers, options.headers);
+  }
+
+  if (isToonstreamUrl(url)) {
+    if (!headers.Referer) {
+      headers.Referer = CONFIG.homeUrl;
+    }
+
+    headers.Origin = TOONSTREAM_ORIGIN;
+    headers["Sec-Fetch-Dest"] = "document";
+    headers["Sec-Fetch-Mode"] = "navigate";
+    headers["Sec-Fetch-Site"] = "same-origin";
+    headers["Sec-Fetch-User"] = "?1";
+
+    if (CONFIG.toonstreamCookies) {
+      headers.Cookie = CONFIG.toonstreamCookies;
+    }
+  }
+
+  return headers;
+}
+
+async function fetchHtmlWithRetry(
+  url,
+  retries = CONFIG.maxRetries,
+  options = {},
+) {
   let lastErr = null;
   let currentProxy = null;
   
@@ -135,13 +222,12 @@ async function fetchHtmlWithRetry(url, retries = CONFIG.maxRetries) {
       const proxyAgent = proxyManager.getProxyAgent(currentProxy);
       
       const config = {
-        timeout: CONFIG.requestTimeout,
-        headers: {
-          "User-Agent": getUA(),
-          Referer: CONFIG.homeUrl,
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
+        timeout: options.timeout || CONFIG.requestTimeout,
+        headers: buildRequestHeaders(url, options),
+        responseType: "text",
+        maxRedirects: 5,
+        decompress: true,
+        validateStatus: (status) => status >= 200 && status < 400,
       };
       
       // Add proxy agent if available
@@ -156,8 +242,18 @@ async function fetchHtmlWithRetry(url, retries = CONFIG.maxRetries) {
       lastErr = err;
       
       // Mark proxy as failed if we're using one
-      if (currentProxy && (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT')) {
+      if (
+        currentProxy &&
+        (err.code === "ECONNREFUSED" || err.code === "ETIMEDOUT")
+      ) {
         proxyManager.markProxyAsFailed(currentProxy);
+      }
+
+      const status = err.response?.status;
+      if (status) {
+        console.warn(
+          `  ⚠️ Request failed (${status}) for ${url} (attempt ${attempt}/${retries})`,
+        );
       }
       
       await delay(500 * attempt);
@@ -290,96 +386,105 @@ function parseEpisodeCode(url) {
   };
 }
 
-async function extractRealVideoUrl(intermediateUrl) {
-  try {
-    const html = await fetchHtmlWithRetry(intermediateUrl);
+async function extractRealVideoUrl(intermediateUrl, options = {}) {
+  const visited = new Set();
+
+  const needsFollow = (url) => {
+    if (!url) return false;
+    if (url.includes("trembed")) return true;
+    if (isToonstreamUrl(url)) return true;
+    return false;
+  };
+
+  const resolve = async (url, depth = 0) => {
+    if (!url) return null;
+    if (visited.has(url)) return url;
+    if (depth > CONFIG.embedMaxDepth) return url;
+
+    visited.add(url);
+
+    let html;
+    try {
+      html = await fetchHtmlWithRetry(url, CONFIG.maxRetries, {
+        referer: options.referer || options.parent || CONFIG.homeUrl,
+      });
+    } catch (err) {
+      console.warn(
+        `  ⚠️ Failed to load embed ${url} (depth ${depth}): ${err.message}`,
+      );
+      return url;
+    }
+
     const $ = cheerio.load(html);
-    
-    // First, try to find video tag with jw-video class (primary method)
-    const videoTags = $('video.jw-video, video[class*="jw-video"]');
-    for (let i = 0; i < videoTags.length; i++) {
-      const video = $(videoTags[i]);
-      const src = video.attr('src') || video.attr('data-src');
-      
-      if (src) {
-        // The src might be a blob URL, so we need to find the actual source
-        // Look for the real URL in the page's JavaScript
-        const scripts = $('script').toArray();
-        for (const script of scripts) {
-          const content = $(script).html() || '';
-          
-          // Look for streaming URLs (common patterns for video hosts)
-          const urlPatterns = [
-            /https?:\/\/[a-zA-Z0-9.-]+\/[a-f0-9-]{36}/gi, // UUID pattern
-            /https?:\/\/play\.[a-zA-Z0-9.-]+\/[a-f0-9-]+/gi, // play.domain.com/id
-            /https?:\/\/[a-zA-Z0-9.-]+\/(?:video|stream|embed)\/[a-zA-Z0-9-]+/gi,
-            /"file"\s*:\s*"(https?:\/\/[^"]+)"/gi,
-            /"source"\s*:\s*"(https?:\/\/[^"]+)"/gi,
-            /"src"\s*:\s*"(https?:\/\/[^"]+)"/gi,
-          ];
-          
-          for (const pattern of urlPatterns) {
-            const matches = content.matchAll(pattern);
-            for (const match of matches) {
-              const url = match[1] || match[0];
-              if (url && !url.includes('trembed') && !url.includes('toonstream.love')) {
-                const normalizedUrl = normalizeUrl(url);
-                if (normalizedUrl && normalizedUrl !== intermediateUrl) {
-                  return normalizedUrl;
-                }
+
+    const pickDirectVideo = () => {
+      const videoTags = $("video, source");
+      for (let i = 0; i < videoTags.length; i++) {
+        const node = $(videoTags[i]);
+        const src = node.attr("src") || node.attr("data-src");
+        const normalized = normalizeUrl(src, url);
+        if (normalized && !normalized.startsWith("blob:")) {
+          return normalized;
+        }
+      }
+      return null;
+    };
+
+    const pickIframe = () => {
+      const iframes = $("iframe");
+      for (let i = 0; i < iframes.length; i++) {
+        const iframe = $(iframes[i]);
+        const raw =
+          iframe.attr("src") ||
+          iframe.attr("data-src") ||
+          iframe.attr("data-lazy-src");
+        const normalized = normalizeUrl(raw, url);
+        if (normalized && normalized !== url) {
+          return normalized;
+        }
+      }
+      return null;
+    };
+
+    const pickFromScripts = () => {
+      const scripts = $("script").toArray();
+      const patterns = [
+        /src["']?\s*:\s*["']([^"']+)["']/gi,
+        /file["']?\s*:\s*["']([^"']+)["']/gi,
+        /"url"\s*:\s*"([^"]+)"/gi,
+        /iframe.*?src=["']([^"']+)["']/gi,
+        /https?:\/\/[^\s"'<>]+/gi,
+      ];
+
+      for (const script of scripts) {
+        const content = $(script).html() || "";
+        for (const pattern of patterns) {
+          const matches = content.matchAll(pattern);
+          for (const match of matches) {
+            const candidate = match[1] || match[0];
+            if (candidate) {
+              const normalized = normalizeUrl(candidate, url);
+              if (normalized && normalized !== url) {
+                return normalized;
               }
             }
           }
         }
       }
+      return null;
+    };
+
+    const candidate =
+      pickDirectVideo() || pickIframe() || pickFromScripts() || url;
+
+    if (needsFollow(candidate) && depth < CONFIG.embedMaxDepth) {
+      return resolve(candidate, depth + 1);
     }
-    
-    // Second, try to find iframe with a src attribute
-    const iframes = $('iframe');
-    for (let i = 0; i < iframes.length; i++) {
-      const iframe = $(iframes[i]);
-      const src = iframe.attr('src') || iframe.attr('data-src') || iframe.attr('data-lazy-src');
-      
-      if (src) {
-        const normalizedSrc = normalizeUrl(src);
-        // Skip if it's the same intermediate URL (avoid loops)
-        if (normalizedSrc && !normalizedSrc.includes('trembed') && normalizedSrc !== intermediateUrl) {
-          return normalizedSrc;
-        }
-      }
-    }
-    
-    // Third, try to find video source in script tags
-    const scripts = $('script').toArray();
-    for (const script of scripts) {
-      const content = $(script).html() || '';
-      
-      // Look for common video embed patterns
-      const patterns = [
-        /src["']?\s*:\s*["']([^"']+)["']/i,
-        /file["']?\s*:\s*["']([^"']+)["']/i,
-        /"url"\s*:\s*"([^"]+)"/i,
-        /iframe.*?src=["']([^"']+)["']/i,
-        /<iframe[^>]+src=["']([^"']+)["']/i,
-      ];
-      
-      for (const pattern of patterns) {
-        const match = content.match(pattern);
-        if (match && match[1] && !match[1].includes('trembed')) {
-          const videoUrl = normalizeUrl(match[1]);
-          if (videoUrl && videoUrl !== intermediateUrl) {
-            return videoUrl;
-          }
-        }
-      }
-    }
-    
-    // If no real video URL found, return the intermediate URL as fallback
-    return intermediateUrl;
-  } catch (err) {
-    console.warn(`  ⚠️ Failed to extract real video from ${intermediateUrl}: ${err.message}`);
-    return intermediateUrl;
-  }
+
+    return candidate;
+  };
+
+  return resolve(intermediateUrl, 0);
 }
 
 function extractPostId(html) {
@@ -435,7 +540,7 @@ async function fetchEpisodeDataFromAPI(postId, season) {
   if (!postId || !season) return null;
   
   try {
-    const url = 'https://toonstream.love/wp-admin/admin-ajax.php';
+    const url = CONFIG.ajaxUrl;
     const params = new URLSearchParams({
       action: 'action_select_season',
       season: season.toString(),
@@ -445,10 +550,14 @@ async function fetchEpisodeDataFromAPI(postId, season) {
     const response = await axios.post(url, params, {
       timeout: CONFIG.requestTimeout,
       headers: {
-        'User-Agent': getUA(),
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': CONFIG.homeUrl,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        "User-Agent": getUA(),
+        "Content-Type": "application/x-www-form-urlencoded",
+        Referer: CONFIG.homeUrl,
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ...(CONFIG.toonstreamCookies
+          ? { Cookie: CONFIG.toonstreamCookies }
+          : {}),
       },
     });
     
@@ -508,7 +617,7 @@ async function fetchEpisodeDataFromAPI(postId, season) {
   }
 }
 
-async function extractEmbeds(html) {
+async function extractEmbeds(html, episodeUrl) {
   const $ = cheerio.load(html);
   const intermediateUrls = [];
   const seen = new Set();
@@ -541,13 +650,17 @@ async function extractEmbeds(html) {
     }
     
     // Extract real video URL
-    const realVideoUrl = await extractRealVideoUrl(intermediateUrl);
+    const realVideoUrl = await extractRealVideoUrl(intermediateUrl, {
+      referer: episodeUrl,
+      parent: episodeUrl,
+    });
     
     embeds.push({ 
       name: serverName,
       url: realVideoUrl,
       real_video: realVideoUrl,
-      type: 'iframe'
+      type: 'iframe',
+      intermediate_url: intermediateUrl,
     });
     
     // Small delay to avoid overwhelming the server
@@ -613,7 +726,9 @@ function extractSeriesMeta(seriesHtml) {
 
 async function resolveSeriesContext(seriesUrl, fallbackTitle) {
   if (seriesCache.has(seriesUrl)) return seriesCache.get(seriesUrl);
-  const html = await fetchHtmlWithRetry(seriesUrl);
+  const html = await fetchHtmlWithRetry(seriesUrl, CONFIG.maxRetries, {
+    referer: CONFIG.homeUrl,
+  });
   const meta = extractSeriesMeta(html);
   if (!meta.title && fallbackTitle) meta.title = fallbackTitle;
   if (!meta.title) meta.title = cleanSlug(seriesUrl).replace(/-/g, " ");
@@ -774,7 +889,9 @@ async function extractSeriesUrlFromBreadcrumb(html) {
 }
 
 async function buildEpisodeRecord(episodeUrl, hints = {}) {
-  const episodeHtml = await fetchHtmlWithRetry(episodeUrl);
+  const episodeHtml = await fetchHtmlWithRetry(episodeUrl, CONFIG.maxRetries, {
+    referer: hints.seriesUrl || CONFIG.homeUrl,
+  });
   const derivedSeriesUrl =
     (await extractSeriesUrlFromBreadcrumb(episodeHtml)) ||
     deriveSeriesUrlFromEpisode(episodeUrl) ||
@@ -789,7 +906,7 @@ async function buildEpisodeRecord(episodeUrl, hints = {}) {
       season: 1,
       episode: Math.floor(Date.now() / 1000),
     };
-  const embeds = await extractEmbeds(episodeHtml);
+  const embeds = await extractEmbeds(episodeHtml, episodeUrl);
 
   // Try to fetch episode image from API
   let apiEpisodeImage = null;
@@ -970,7 +1087,9 @@ function extractSeasonNumbers(html) {
 
 async function ensureSeriesComplete(seriesCtx) {
   try {
-    const html = await fetchHtmlWithRetry(seriesCtx.url);
+    const html = await fetchHtmlWithRetry(seriesCtx.url, CONFIG.maxRetries, {
+      referer: CONFIG.homeUrl,
+    });
     
     // Extract post ID from series page
     const postId = extractPostId(html);
@@ -1177,10 +1296,32 @@ async function auditAndUpdateEmptyServers(
   }
 }
 
+async function fetchHomepageHtml() {
+  let lastErr = null;
+  for (const candidate of CONFIG.homepageCandidates) {
+    try {
+      const html = await fetchHtmlWithRetry(candidate, CONFIG.maxRetries, {
+        referer: CONFIG.homeUrl,
+      });
+      if (candidate !== CONFIG.homeUrl) {
+        console.log(`ℹ️ Using homepage fallback: ${candidate}`);
+      }
+      return html;
+    } catch (err) {
+      lastErr = err;
+      console.warn(
+        `⚠️ Failed to fetch homepage ${candidate}: ${err.message}`,
+      );
+      await delay(500);
+    }
+  }
+  throw lastErr || new Error("All homepage candidates failed");
+}
+
 async function pollHomepage() {
   const latestSeriesSlugs = new Set();
   try {
-    const html = await fetchHtmlWithRetry(CONFIG.homeUrl);
+    const html = await fetchHomepageHtml();
     const cards = extractEpisodeCards(html);
     console.log(`🔍 Found ${cards.length} candidate episodes`);
     for (const card of cards) {
