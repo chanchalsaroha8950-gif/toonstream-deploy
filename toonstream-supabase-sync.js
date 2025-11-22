@@ -1434,7 +1434,7 @@ async function updateSeriesFromLatestEpisodes(latestSeriesSlugs) {
   }
 }
 
-async function start() {
+export async function start() {
   console.log("🚀 Toonstream -> Supabase sync started");
   console.log("📡 Fetching latest episodes from Toonstream...\n");
   
@@ -1460,7 +1460,16 @@ async function start() {
   printSummary();
 }
 
-start().catch((err) => {
-  console.error("\n❌ Error occurred:", err.message);
-  process.exit(1);
-});
+// Run directly if this file is executed standalone (not imported)
+// Check if this is the main module by seeing if it was run directly
+const isMainModule = process.argv[1] && (
+  process.argv[1].endsWith('toonstream-supabase-sync.js') ||
+  process.argv[1].includes('toonstream-supabase-sync.js')
+);
+
+if (isMainModule) {
+  start().catch((err) => {
+    console.error("\n❌ Error occurred:", err.message);
+    process.exit(1);
+  });
+}
